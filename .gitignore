@@ -1,0 +1,14 @@
+# Terraform State & Lock Files
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Secrets
+terraform.tfvars
+.env
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
