@@ -195,16 +195,16 @@ As a continuation of our previous sprint where we did an R&D around leveraging T
 In this sprint, we focused on three major areas to strengthen our infrastructure testing approach:
 	1.	Test Design Coverage Document
 We created a comprehensive Test Coverage Design document for all key MDXi provisioned resources.
-This document outlines major possible automated test cases for each resource type, including scenarios for validation, compliance and functional correctness for each resource. We categorised our test scenarios in 2 types static and runtime which will be better for us to 
-It has been uploaded to Jira Confluence for easy access, so going forward, whenever we implement Terratest for any resource, we can reuse this design to save effort and maintain consistency.
+This document outlines major possible automated test cases for each resource type, including scenarios for validation, compliance and functional correctness. We categorised our test scenarios in 2 types static and runtime which will be better for us to 
+It has been uploaded to Jira Confluence for easy access, so going forward, We can refer to check what could be the possible test cases scenarios and reuse this design to save effort and maintain consistency.
 	2.	Go-based Terratest Suites Implementation
 We developed Go-based Terratest suites to automate the testing of our key MDIXI Azure resources.
 As of now, we implemented automated test cases for Azure Container Registry (ACR), Azure Functions, Log Analytics with Diagnostics, and Azure WebApp modules.
-Some resources like SQL MI are pending due to earlier challenges we faced with AVM module configurations. However, we have resolved these blockers and plan to complete their test coverage in the very soon.
+Some resources like SQL MI are pending due to some challenges we faced with AVM module configurations. However, we have resolved these blockers and plan to complete their test coverage very soon.
 	3.	Integration with GitHub Actions Pipeline
-After developing the Automation tests, we integrated them into our GitHub Actions CI pipeline.
-Now, whenever a PR is raised or updated, it automatically triggers the Terratest suites, validating the provisioned infrastructure end-to-end.
-This means PR merges will be blocked if the  tests fail, ensuring that misconfigurations or policy violations are caught early in the CI/CD process before reaching production.
-Ultimately, this integration enhances release confidence, improves deployment reliability, and minimizes the risk of outages due to incorrect infrastructure as code setup.
+After developing the Automation tests, we will integrate them into our GitHub Actions CI pipeline.
+Currently, the pipeline setup is ready and integration work is in progress.
+Once it is fully integrated, whenever a PR is raised or updated, it will automatically trigger the Terratest suites to validate the provisioned infrastructure end-to-end which ensure that misconfigurations and violations are caught early in CI/CD process before reaching the production
+Ultimately, this integration enhances release confidence, improves deployment reliability, and minimizes the risk of outages due to incorrect infrastructure as code setup. 
 
 These efforts enable faster and safer Azure deployments with reduced manual testing, fewer production issues, and higher confidence in delivering secure and compliant infrastructure.
