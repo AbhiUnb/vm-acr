@@ -1,210 +1,340 @@
 package test
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
+	"os/exec"
 	"strings"
 	"testing"
 
-	"github.com/gruntwork-io/terratest/modules/terraform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-type CcResourceGroup struct {
-	Location string            `json:"location"`
-	Tags     map[string]string `json:"tags"`
-	Lock     *struct {
-		Level string  `json:"level"`
-		Notes *string `json:"notes"`
-	} `json:"lock"`
+// fetchAzureCLI runs an az cli command and returns output trimmed.
+func fetchAzureCLI(args ...string) string {
+	cmd := exec.Command("az", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("Azure CLI command failed: az %s\nError: %v\n", strings.Join(args, " "), err)
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
-func loadTfVars(t *testing.T) map[string]CcResourceGroup {
-	data, err := os.ReadFile("../terraform.tfvars.json")
-	require.NoError(t, err)
-
-	raw := make(map[string]json.RawMessage)
-	err = json.Unmarshal(data, &raw)
-	require.NoError(t, err)
-
-	var rawMap json.RawMessage = raw["cc_resource_groups"]
-	result := make(map[string]CcResourceGroup)
-	err = json.Unmarshal(rawMap, &result)
-	require.NoError(t, err)
-
-	return result
-}
-
-func TestCcRgOutputsAndLocks(t *testing.T) {
+func TestAzureFunctionApp(t *testing.T) {
 	t.Parallel()
 
-	tfvars := loadTfVars(t)
+	// Fetch function app name and resource group from ENV variables
+	functionAppName := os.Getenv("FUNCTION_APP_NAME")
+	resourceGroup := os.Getenv("RESOURCE_GROUP")
 
-	terraformOptions := terraform.WithDefaultRetryableErrors(t, &terraform.Options{
-		TerraformDir: "../",
-		VarFiles:     []string{"terraform.tfvars.json"},
+	require.NotEmpty(t, functionAppName, "FUNCTION_APP_NAME env variable is required")
+	require.NotEmpty(t, resourceGroup, "RESOURCE_GROUP env variable is required")
+
+	t.Logf("🔧 Testing Function App: %s in RG: %s", functionAppName, resourceGroup)
+
+	// Fetch function app URL dynamically
+	functionAppURL := fetchAzureCLI("webapp", "show", "--name", functionAppName, "--resource-group", resourceGroup, "--query", "defaultHostName", "-o", "tsv")
+	require.NotEmpty(t, functionAppURL, "Function App URL could not be fetched from Azure CLI")
+	t.Logf("🔗 Function App URL: %s", functionAppURL)
+
+	// 1. Validate existence
+	t.Run("ValidateFunctionAppExistence", func(t *testing.T) {
+		assert.NotEmpty(t, functionAppURL, "Function App URL should not be empty")
 	})
 
-	// defer terraform.Destroy(t, terraformOptions)
-	// terraform.InitAndApply(t, terraformOptions)
+	// 2. Validate hosting plan SKU
+	t.Run("ValidateHostingPlanSKU", func(t *testing.T) {
+		// Fetch service plan resource ID from function app
+		planID := fetchAzureCLI("webapp", "show", "--name", functionAppName, "--resource-group", resourceGroup, "--query", "appServicePlanId", "-o", "tsv")
+		require.NotEmpty(t, planID, "Service Plan ID could not be fetched")
 
-	rgOutputs := terraform.OutputMapOfObjects(t, terraformOptions, "cc_rg_outputs")
-	rgLocks := terraform.OutputMap(t, terraformOptions, "cc_rg_locks")
-	principalID := terraform.Output(t, terraformOptions, "current_principal_id")
-	roleAssignments := terraform.OutputMapOfObjects(t, terraformOptions, "rg_role_assignments_principals")
-	roleIDs := terraform.OutputMap(t, terraformOptions, "role_ids")
+		// Extract the plan name from the resource ID
+		parts := strings.Split(planID, "/")
+		appServicePlanName := parts[len(parts)-1]
+		t.Logf("✅ Dynamically fetched App Service Plan Name: %s", appServicePlanName)
 
-	for rgName, expected := range tfvars {
-		t.Run(fmt.Sprintf("Validate_%s", rgName), func(t *testing.T) {
-			outRaw, ok := rgOutputs[rgName]
-			require.True(t, ok, "RG output missing for "+rgName)
+		// Validate the SKU of the App Service Plan
+		sku := fetchAzureCLI("appservice", "plan", "show", "--name", appServicePlanName, "--resource-group", resourceGroup, "--query", "sku.name", "-o", "tsv")
+		assert.Contains(t, []string{"Y1", "EP1", "P1v2"}, sku, "App Service Plan SKU should be Consumption, Premium, or Dedicated")
+	})
 
-			out, ok := outRaw.(map[string]interface{})
-			require.True(t, ok, "RG output for "+rgName+" is not a map")
+	// 3. Validate deployment source
+	t.Run("ValidateDeploymentSource", func(t *testing.T) {
+		deploymentSource := fetchAzureCLI("functionapp", "deployment", "source", "show", "--name", functionAppName, "--resource-group", resourceGroup, "--query", "repoUrl", "-o", "tsv")
+		if deploymentSource == "" {
+			t.Log("⚠️ Deployment source not configured; skipping")
+		} else {
+			t.Logf("🔗 Deployment Source: %s", deploymentSource)
+		}
+	})
 
-			name := out["name"].(string)
-			location := out["location"].(string)
-			id := out["id"].(string)
-			tags := out["tags"].(map[string]interface{})
+	// 4. Validate App Settings (runtime and Application Insights)
+	t.Run("ValidateAppSettings", func(t *testing.T) {
+		runtime := fetchAzureCLI("webapp", "config", "show", "--name", functionAppName, "--resource-group", resourceGroup, "--query", "linuxFxVersion", "-o", "tsv")
+		if runtime == "" {
+			// fallback for Windows .NET apps
+			runtime = fetchAzureCLI("webapp", "config", "show", "--name", functionAppName, "--resource-group", resourceGroup, "--query", "netFrameworkVersion", "-o", "tsv")
+		}
 
-			// Name check (should contain logical name)
-			assert.True(t, strings.Contains(strings.ToLower(name), strings.ToLower(rgName)), "Name mismatch for "+rgName)
+		assert.NotEmpty(t, runtime, "Web App runtime could not be determined")
+		t.Logf("✅ Web App runtime: %s", runtime)
 
-			// Location check
-			assert.Equal(t, expected.Location, location)
+		// Adjust runtime validation based on actual deployment expectations
+		if strings.Contains(strings.ToLower(runtime), "dotnet") || strings.Contains(strings.ToLower(runtime), "net") || strings.Contains(strings.ToLower(runtime), ".net") {
+			t.Log("✅ Detected .NET runtime")
+		} else if strings.Contains(strings.ToLower(runtime), "node") {
+			t.Log("✅ Detected Node.js runtime")
+		} else {
+			t.Logf("⚠️ Detected other runtime: %s", runtime)
+		}
 
-			// ID format check
-			assert.Regexp(t, regexp.MustCompile(`^/subscriptions/.+/resourceGroups/.+`), id)
+		insightsName := "ai-" + functionAppName
+		insightsKey := fetchAzureCLI("resource", "show", "--name", insightsName, "--resource-group", resourceGroup, "--resource-type", "Microsoft.Insights/components", "--query", "instrumentationKey", "-o", "tsv")
+		assert.NotEmpty(t, insightsKey, fmt.Sprintf("Application Insights key for %s should exist", insightsName))
+	})
 
-			// Tags check
-			for k, v := range expected.Tags {
-				tagValue, exists := tags[k]
-				require.True(t, exists, fmt.Sprintf("Expected tag '%s' missing in %s", k, rgName))
-				assert.Equal(t, v, tagValue)
+	// 5. Validate trigger behavior (HTTP test)
+	/*
+		t.Run("ValidateTriggerBehavior", func(t *testing.T) {
+			triggerName := "httpexample"
+			testName := "Terratest"
+
+			testURL := functionAppURL
+			if !strings.HasPrefix(testURL, "http") {
+				testURL = "https://" + testURL
 			}
+			testURL += "/api/" + triggerName + "?name=" + testName
 
-			// Lock level check
-			expectedLock := ""
-			if expected.Lock != nil {
-				expectedLock = expected.Lock.Level
-			}
-			actualLock := rgLocks[rgName]
+			resp, err := http.Get(testURL)
+			require.NoError(t, err, "HTTP request to function should not error")
+			defer resp.Body.Close()
 
-			if expectedLock == "" {
-				assert.True(t, actualLock == "" || actualLock == "null", "Expected no lock for "+rgName)
-			} else {
-				assert.Equal(t, expectedLock, actualLock)
-			}
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode, "Expected HTTP 200 OK")
+			assert.Contains(t, string(body), "Hello, "+testName+"!", "Response should greet the test name")
 		})
+	*/
+}
+test file
 
-		// RBAC Security Check: Only current principal should be assigned to RG
 
-		t.Run(fmt.Sprintf("RBACContainsCurrentPrincipal_%s", rgName), func(t *testing.T) {
-			assignmentsRaw := roleAssignments[rgName]
-			assignmentsList, ok := assignmentsRaw.([]interface{})
-			require.True(t, ok, "Invalid RBAC assignments for "+rgName)
+main.tf
 
-			found := false
-			for _, entry := range assignmentsList {
-				aMap := entry.(map[string]interface{})
-				pid := aMap["principal_id"].(string)
-				if pid == principalID {
-					found = true
-					break
-				}
-			}
-			assert.True(t, found, fmt.Sprintf("Current principal %s not assigned to RG %s", principalID, rgName))
-		})
 
-		// uncomment the negative test case "RBAC_NoUnauthorizedPrincipals"  to test no unauthorized principals are assigned to a resource group
-		// (i.e., only the current_principal_id is allowed) — and it will fail the test if any other principal is found.
-		// t.Run("RBAC_NoUnauthorizedPrincipals", func(t *testing.T) {
-		// 	for rgName, assignmentsRaw := range roleAssignments {
-		// 		assignmentsList, ok := assignmentsRaw.([]interface{})
-		// 		require.True(t, ok, "Invalid RBAC assignments for "+rgName)
 
-		// 		for _, entry := range assignmentsList {
-		// 			aMap := entry.(map[string]interface{})
-		// 			pid := aMap["principal_id"].(string)
+# # resource "azurerm_app_service_plan" "MFDMCCASPAFUNC" {
+# #   name                = "MFDMCCPRODASPAFUNC"
+# #   resource_group_name = var.cc_core_resource_group_name
+# #   location            = var.cc_location
+# #   kind                = "FunctionApp"
+# #   sku {
+# #     tier = "PremiumV2"
+# #     size = "P1v2"
+# #   }
+# # }
 
-		// 			assert.Equal(t, principalID, pid, fmt.Sprintf(
-		// 				"Unauthorized principal %s found in RG %s. Only current principal %s should have access.",
-		// 				pid, rgName, principalID,
-		// 			))
-		// 		}
-		// 	}
-		// })
 
-		// Ensure at least one role assignment exists per RG
-		t.Run("RBAC_HasAtLeastOneAssignment", func(t *testing.T) {
-			for rgName, assignmentsRaw := range roleAssignments {
-				assignmentsList, ok := assignmentsRaw.([]interface{})
-				require.True(t, ok, "Invalid RBAC assignments for "+rgName)
-				assert.Greater(t, len(assignmentsList), 0, fmt.Sprintf("No RBAC assignments found for RG %s", rgName))
-			}
-		})
+resource "azurerm_service_plan" "MFDMCCASPAFUNC" {
+  resource_group_name = var.cc_core_resource_group_name
+  location            = var.cc_location
+  name                = "MFDMCCPRODASPAFUNC"
+  os_type             = "Linux"
+  sku_name            = "Y1"
+  tags                = local.tag_list_1
+}
 
-		// To Ensure current principal has Contributor role
-		t.Run("CurrentPrincipalMustBeContributor", func(t *testing.T) {
-			principalID := terraform.Output(t, terraformOptions, "current_principal_id")
-			roleAssignments := terraform.OutputMapOfObjects(t, terraformOptions, "rg_role_assignments_principals")
+module "avm-res-web-site" {
+  source              = "Azure/avm-res-web-site/azurerm"
+  version             = "0.16.4"
+  for_each            = local.functionapp
+  name                = each.value.name
+  resource_group_name = var.cc_core_resource_group_name
+  location            = var.cc_location
 
-			contributorIdShort := strings.ToLower(strings.TrimPrefix(roleIDs["Contributor"], "/providers/Microsoft.Authorization/roleDefinitions/"))
+  kind = each.value.kind
 
-			fmt.Printf("Current Principal ID: %s\n", principalID)
-			fmt.Printf("Contributor Role UUID: %s\n", contributorIdShort)
+  # Uses an existing app service plan
+  os_type                  = azurerm_service_plan.MFDMCCASPAFUNC.os_type
+  service_plan_resource_id = azurerm_service_plan.MFDMCCASPAFUNC.id
 
-			for rgName, assignmentsRaw := range roleAssignments {
-				fmt.Printf("Checking RG: %s\n", rgName)
+  # Uses an existing storage account
+  storage_account_name       = each.value.storage_account_name
+  storage_account_access_key = each.value.storage_account_access_key
+  
+  # storage_uses_managed_identity = true
+  site_config = {
+    always_on = false
+  }
 
-				assignmentsList := assignmentsRaw.([]interface{})
-				found := false
-				for _, entry := range assignmentsList {
-					e := entry.(map[string]interface{})
-					pid := fmt.Sprintf("%v", e["principal_id"])
-					rid := fmt.Sprintf("%v", e["role_definition_id"])
+  tags = local.tag_list_1
 
-					fmt.Printf("  - principal_id:        %s\n", pid)
-					fmt.Printf("  - role_definition_id:  %s\n", rid)
 
-					if pid == principalID && strings.HasSuffix(strings.ToLower(rid), contributorIdShort) {
-						found = true
-						fmt.Printf("Match found in %s\n", rgName)
-						break
-					}
-				}
-				assert.True(t, found, fmt.Sprintf("Current principal %s must have Contributor role in %s", principalID, rgName))
-			}
-		})
-	}
+}
+
+# resource "azurerm_linux_function_app" "my_function" {
+#   name                = "my-node-function-app1"
+#   resource_group_name = var.cc_core_resource_group_name
+#   location            = var.cc_location
+#   service_plan_id     = azurerm_service_plan.MFDMCCASPAFUNC.id
+
+#   storage_account_name       = "mfmdiccprodfunctionsa"
+#   storage_account_access_key = 
+#   site_config {
+#     always_on = false
+
+#     application_stack {
+#       node_version = "18"
+#     }
+
+#     //function_app_timeout = "PT5M"
+#   }
+
+#   identity {
+#     type = "SystemAssigned"
+#   }
+
+#   tags = local.tag_list_1
+# }
+
+output
+output "cc_location" {
+  value       = var.cc_location
+  description = "Canada Central Region"
+}
+
+output "cc_core_resource_group_name" {
+  value       = var.cc_core_resource_group_name
+  description = "Resource Group Name for McCain Foods Manufacturing Digital Shared Azure Components in Canada Central"
+}
+
+output "MF_DM_CC_CORE_appSP_Name" {
+  value       = var.MF_DM_CC_CORE_appSP_Name
+  description = "Web App Service Plan name for McCain Foods MF Digital Canada Central"
+}
+
+output "MF_DM_CC_CORE_Webapp_Name" {
+  value       = var.MF_DM_CC_CORE_Webapp_Name
+  description = "Web App name for McCain Foods MF Digital Canada Central"
+}
+
+output "function_app_url" {
+  value       = module.avm-res-web-site["MF-MDI-CC-GHPROD-DDDS-AFUNC"].resource_uri
+  description = "The default hostname of the Azure Function App"
+}
+
+output "function_app_insights" {
+  value       = module.avm-res-web-site["MF-MDI-CC-GHPROD-DDDS-AFUNC"].application_insights
+  description = "Application Insights resource details for the Function App"
+  sensitive   = true
+}
+
+tfvarzs
+
+
+cc_location = "canadacentral"
+
+cc_core_resource_group_name = "rg-mccain-core-prod"
+
+MF_DM_CC_CORE_appSP_Name = "MFDMCCPRODASPAFUNCie"
+
+MF_DM_CC_CORE_Webapp_Name = "MFDMCCPRODFUNCTIONAPP"
+
+cc_core_function_apps = {
+  myfunctionapp = {
+    name                        = "MFDMCCPRODFUNCTIONAPP"
+    location                    = "canadacentral"
+    os_type                     = "Linux"
+    storage_account_name        = "mfmdiccprodsa"
+    storage_account_access_key  = "your-storage-account-access-key"
+    storage_account_rg          = "rg-mccain-core-prod"
+    network_name                = "mccain-vnet-prod"
+    subnet_name                 = "function-subnet"
+    user_assigned_identity_name = "mccain-func-identity"
+    user_assigned_identity_rg   = "rg-mccain-core-prod"
+    app_insights_name           = "mccain-func-appinsights"
+    app_insights_rg             = "rg-mccain-core-prod"
+    key_vault_name              = "mccain-keyvault-prod"
+
+
+    additional_app_settings = {
+      WEBSITE_RUN_FROM_PACKAGE = "https://storageaccount.blob.core.windows.net/container/package.zip?<sas_token>"
+      # Example Key Vault reference syntax
+     
+    }
+  }
+}
+
+variable
+variable "cc_location" {
+  type        = string
+  description = "Canada Central Region"
+}
+
+variable "cc_core_resource_group_name" {
+  type        = string
+  description = "Resource Group Name for McCain Foods Manufacturing Digital Shared Azure Components in Canada Central"
+}
+
+
+variable "MF_DM_CC_CORE_appSP_Name" {
+  description = "Web App Service Plan name for McCain Foods MF Digital Canada Central"
+  type        = string
+}
+
+variable "MF_DM_CC_CORE_Webapp_Name" {
+  description = "Web App name for McCain Foods MF Digital Canada Central"
+  type        = string
+}
+
+variable "cc_core_function_apps" {
+  type        = map(any)
+  description = "Map of Function Apps with their configuration"
+}
+
+
+locals.tf
+locals {
+  tag_list_1 = {
+    "Application Name" = "McCain DevSecOps"
+    "GL Code"          = "N/A"
+    "Environment"      = "sandbox"
+    "IT Owner"         = "mccain-azurecontributor@mccain.ca"
+    "Onboard Date"     = "12/19/2024"
+    "Modified Date"    = "N/A"
+    "Organization"     = "McCain Foods Limited"
+    "Business Owner"   = "trilok.tater@mccain.ca"
+    "Implemented by"   = "trilok.tater@mccain.ca"
+    "Resource Owner"   = "trilok.tater@mccain.ca"
+    "Resource Posture" = "Private"
+    "Resource Type"    = "Terraform POC"
+    "Built Using"      = "Terraform"
+  }
+
+
+  functionapp = {
+    MF-MDI-CC-GHPROD-DDDS-AFUNC = {
+      name                       = "MF-MDI-CC-GHPROD-DDDS-AFUNCie"
+      kind                       = "functionapp"
+      storage_account_name       = "mfmdiccprodfunctionsa"
+      storage_account_access_key = 
+    }
+  }
+
+  applicationinsights = {
+  ai-MF-MDI-CC-GHPROD-DDDS-AFUNC = {
+    name                = "ai-MF-MDI-CC-GHPROD-DDDS-AFUNCie"
+    location            = "canadacentral"
+    resource_group_name = "rg-mccain-core-prod"
+    application_type    = "web"
+  }
 }
 
 
 
 
 
-
-
-Hi Shreya,
-
-As a continuation of our previous sprint where we did an R&D around leveraging Terratest for testing our Terraform-based infrastructure, we identified that until now, we were only validating the syntax of our IaC code, but the actual behavior and configuration of provisioned resources were being tested manually.
-
-In this sprint, we focused on three major areas to strengthen our infrastructure testing approach:
-	1.	Test Design Coverage Document
-We created a comprehensive Test Coverage Design document for all key MDXi provisioned resources.
-This document outlines major possible automated test cases for each resource type, including scenarios for validation, compliance and functional correctness. We categorised our test scenarios in 2 types static and runtime which will be better for us to 
-It has been uploaded to Jira Confluence for easy access, so going forward, We can refer to check what could be the possible test cases scenarios and reuse this design to save effort and maintain consistency.
-	2.	Go-based Terratest Suites Implementation
-We developed Go-based Terratest suites to automate the testing of our key MDIXI Azure resources.
-As of now, we implemented automated test cases for Azure Container Registry (ACR), Azure Functions, Log Analytics with Diagnostics, and Azure WebApp modules.
-Some resources like SQL MI are pending due to some challenges we faced with AVM module configurations. However, we have resolved these blockers and plan to complete their test coverage very soon.
-	3.	Integration with GitHub Actions Pipeline
-After developing the Automation tests, we will integrate them into our GitHub Actions CI pipeline.
-Currently, the pipeline setup is ready and integration work is in progress.
-Once it is fully integrated, whenever a PR is raised or updated, it will automatically trigger the Terratest suites to validate the provisioned infrastructure end-to-end which ensure that misconfigurations and violations are caught early in CI/CD process before reaching the production
-Ultimately, this integration enhances release confidence, improves deployment reliability, and minimizes the risk of outages due to incorrect infrastructure as code setup. 
-
-These efforts enable faster and safer Azure deployments with reduced manual testing, fewer production issues, and higher confidence in delivering secure and compliant infrastructure.
+}
